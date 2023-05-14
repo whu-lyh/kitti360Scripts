@@ -1,8 +1,12 @@
 import os
 import numpy as np
+import csv
 import re
 import yaml
 import sys
+from tqdm import tqdm
+
+sys.path.append('../../') # this could make the installation unnecessary
 from kitti360scripts.devkits.commons.loadCalibration import loadCalibrationCameraToPose
 
 def readYAMLFile(fileName):
@@ -15,7 +19,7 @@ def readYAMLFile(fileName):
         yamlFileOut = fin.read()
         myRe = re.compile(r":([^ ])")   # Add space after ":", if it doesn't exist. Python yaml requirement
         yamlFileOut = myRe.sub(r': \1', yamlFileOut)
-        ret = yaml.load(yamlFileOut)
+        ret = yaml.full_load(yamlFileOut) # full_load instead of load for higher version of pyyaml
     return ret
 
 class Camera:
@@ -26,22 +30,23 @@ class Camera:
 
         # load poses
         poses = np.loadtxt(self.pose_file)
+        # get the first column of all datas
         frames = poses[:,0]
+        # pose is GPS/IMU to world coordinate
         poses = np.reshape(poses[:,1:],[-1,3,4])
         self.cam2world = {}
-        self.frames = frames
-        for frame, pose in zip(frames, poses): 
+        self.frames = frames # array of numpy.float64
+        for frame, pose in zip(frames, poses):
+            # reshape to homogeneous coordinates
             pose = np.concatenate((pose, np.array([0.,0.,0.,1.]).reshape(1,4)))
             # consider the rectification for perspective cameras
             if self.cam_id==0 or self.cam_id==1:
-                self.cam2world[frame] = np.matmul(np.matmul(pose, self.camToPose),
-                                                  np.linalg.inv(self.R_rect))
+                self.cam2world[frame] = np.matmul(np.matmul(pose, self.camToPose), np.linalg.inv(self.R_rect))
             # fisheye cameras
             elif self.cam_id==2 or self.cam_id==3:
                 self.cam2world[frame] = np.matmul(pose, self.camToPose)
             else:
                 raise RuntimeError('Unknown Camera ID!')
-
 
     def world2cam(self, points, R, T, inverse=False):
         assert (points.ndim==R.ndim)
@@ -92,7 +97,6 @@ class Camera:
         obj3d.vertices_depth = depth 
         obj3d.generateMeshes()
 
-
 class CameraPerspective(Camera):
 
     def __init__(self, root_dir, seq='2013_05_28_drive_0009_sync', cam_id=0):
@@ -104,6 +108,7 @@ class CameraPerspective(Camera):
         self.pose_file = os.path.join(pose_dir, "poses.txt")
         self.intrinsic_file = os.path.join(calib_dir, 'perspective.txt')
         fileCameraToPose = os.path.join(calib_dir, 'calib_cam_to_pose.txt')
+        # camera to GPS/IMU coordinate
         self.camToPose = loadCalibrationCameraToPose(fileCameraToPose)['image_%02d' % cam_id]
         self.cam_id = cam_id
         super(CameraPerspective, self).__init__()
@@ -199,71 +204,86 @@ class CameraFisheye(Camera):
 
         return x, y, norm * points[:,2] / np.abs(points[:,2])
 
+
+
 if __name__=="__main__":
     import cv2
     import matplotlib.pyplot as plt
-    from labels import id2label
 
-    if 'KITTI360_DATASET' in os.environ:
-        kitti360Path = os.environ['KITTI360_DATASET']
-    else:
-        kitti360Path = os.path.join(os.path.dirname(
-                                os.path.realpath(__file__)), '..', '..')
+    # if 'KITTI360_DATASET' in os.environ:
+    #     kitti360Path = os.environ['KITTI360_DATASET']
+    # else:
+    #     kitti360Path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..')
+    kitti360Path = "/data-lyh/KITTI360"
+    kitti360panoPath = "/data-lyh/KITTI360"
     
     seq = 3
-    cam_id = 2
-    sequence = '2013_05_28_drive_%04d_sync'%seq
-    # perspective
-    if cam_id == 0 or cam_id == 1:
-        camera = CameraPerspective(kitti360Path, sequence, cam_id)
-    # fisheye, 2-left,3-right
-    elif cam_id == 2 or cam_id == 3:
-        camera = CameraFisheye(kitti360Path, sequence, cam_id)
-        print(camera.fi)
-    else:
-        raise RuntimeError('Invalid Camera ID!')
+    cam_id = 3
 
-    # loop over frames
-    for frame in camera.frames:
+    seq_all = [0,2,3,4,5,6,7,9,10]
+
+    for seq in seq_all:
+        sequence = '2013_05_28_drive_%04d_sync'%seq
         # perspective
         if cam_id == 0 or cam_id == 1:
-            image_file = os.path.join(kitti360Path, 'data_2d_raw', sequence, 'image_%02d' % cam_id, 'data_rect', '%010d.png'%frame)
-        # fisheye
+            camera = CameraPerspective(kitti360Path, sequence, cam_id)
+        # fisheye, 2-left,3-right
         elif cam_id == 2 or cam_id == 3:
-            image_file = os.path.join(kitti360Path, 'data_2d_raw', sequence, 'image_%02d' % cam_id, 'data_rgb', '%010d.png'%frame)
+            camera = CameraFisheye(kitti360Path, sequence, cam_id)
+            #print("camera.fi:",camera.fi)
         else:
             raise RuntimeError('Invalid Camera ID!')
-        if not os.path.isfile(image_file):
-            print('Missing %s ...' % image_file)
-            continue
 
+        # loop over frames
+        target_path = os.path.join(kitti360panoPath,"data_2d_pano",sequence)
+        if not os.path.exists(target_path):
+            os.mkdir(target_path)
+        query_file = os.path.join(target_path,"query.csv")
+        database_file = os.path.join(target_path,"database.csv")
+        print('query_file:\t{}'.format(query_file))
+        print('database_file:\t{}'.format(database_file))
 
-        print(image_file)
-        image = cv2.imread(image_file)
-        plt.imshow(image[:,:,::-1])
-
-        # 3D bbox
-        from annotation import Annotation3D
-        label3DBboxPath = os.path.join(kitti360Path, 'data_3d_bboxes')
-        annotation3D = Annotation3D(label3DBboxPath, sequence)
-
-        points = []
-        depths = []
-        for k,v in annotation3D.objects.items():
-            if len(v.keys())==1 and (-1 in v.keys()): # show static only
-                obj3d = v[-1]
-                if not id2label[obj3d.semanticId].name=='building': # show buildings only
-                    continue
-                camera(obj3d, frame)
-                vertices = np.asarray(obj3d.vertices_proj).T
-                points.append(np.asarray(obj3d.vertices_proj).T)
-                depths.append(np.asarray(obj3d.vertices_depth))
-                for line in obj3d.lines:
-                    v = [obj3d.vertices[line[0]]*x + obj3d.vertices[line[1]]*(1-x) for x in np.arange(0,1,0.01)]
-                    uv, d = camera.project_vertices(np.asarray(v), frame)
-                    mask = np.logical_and(np.logical_and(d>0, uv[0]>0), uv[1]>0)
-                    mask = np.logical_and(np.logical_and(mask, uv[0]<image.shape[1]), uv[1]<image.shape[0])
-                    plt.plot(uv[0][mask], uv[1][mask], 'r.')
-
-        plt.pause(0.5)
-        plt.clf()
+        np.set_printoptions(suppress=True,threshold=np.inf)
+        with open(query_file,'w',newline='') as f_query, open(database_file,'w',newline='') as f_databse:
+            writer_query = csv.writer(f_query)
+            writer_database = csv.writer(f_databse)
+            header = ['','key','east','north']
+            writer_query.writerow(header)
+            writer_database.writerow(header)
+            cnt_q = cnt_db = 0
+            accum_dist = 0.0
+            pre_frame_id = 0
+            for frame in tqdm(camera.frames):
+                # # perspective
+                # if cam_id == 0 or cam_id == 1:
+                #     image_file = os.path.join(kitti360Path, 'data_2d_raw', sequence, 'image_%02d' % cam_id, 'data_rect', '%010d.png'%frame)
+                # # fisheye
+                # elif cam_id == 2 or cam_id == 3:
+                #     image_file = os.path.join(kitti360Path, 'data_2d_raw', sequence, 'image_%02d' % cam_id, 'data_rgb', '%010d.png'%frame)
+                # else:
+                #     raise RuntimeError('Invalid Camera ID!')
+                # #print("image_file_id:{},name:{}:".format(frame,image_file))
+                pose = camera.cam2world[frame]
+                #print(type(pose))
+                #print("pose:",pose)
+                # to make the structure same as the AE-Sperical paper
+                frame_str = '%g'%(frame)
+                frame_str = frame_str.ljust(10,'a')
+                if frame > 1:
+                    pre_pose = camera.cam2world[pre_frame_id]
+                    accum_dist = accum_dist + ((pose[0,3]-pre_pose[0,3])**2 + (pose[1,3]-pre_pose[1,3])**2) **0.5
+                    if accum_dist > 3.0:
+                        record = [cnt_q,frame_str,pose[0,3],pose[1,3]]
+                        writer_query.writerow(record)
+                        accum_dist = 0.0
+                        cnt_q = cnt_q + 1
+                    else:
+                        record = [cnt_db,frame_str,pose[0,3],pose[1,3]]
+                        writer_database.writerow(record)
+                        cnt_db = cnt_db + 1
+                else:
+                    record = [cnt_db,frame_str,pose[0,3],pose[1,3]]
+                    writer_database.writerow(record)
+                    cnt_db = cnt_db + 1
+                
+                pre_frame_id = frame           
